@@ -1,0 +1,528 @@
+#!/usr/bin/python
+# yxcba
+# Copyright (c) 2014 Tom Marble
+# Licensed under { copyleft-next | AGPv3+ }
+
+from __future__ import print_function
+
+import sys
+import os
+import pwd
+import time
+import argparse
+import re
+import xcb
+import xcb.xtest
+import xcb.render
+import xcb.xproto
+from xcb.xproto import EventMask as EM
+import xpybutil
+from xpybutil import conn
+import xpybutil.ewmh as ewmh
+import xpybutil.event as event
+import xpybutil.cursor as cursor
+import xpybutil.window as window
+import xpybutil.keybind as keybind
+
+
+def argb(a, r, g, b):
+    return (((((a << 8) + r) << 8) + g) << 8) + b
+
+
+def get_visual_32(screen):
+    for d in screen.depths:
+        for v in d.visuals:
+            if d.depth == 32:
+                return v.visual
+    return None
+
+
+class Duck(object):
+
+  def __init__(self):
+    pass
+
+  def __repr__(self):
+    s = 'a Duck with... '
+    for k in self.__dict__:
+      s += '%s = %s, ' % (k, str(self.__dict__[k]))
+    return s
+
+  def __getattr__(self, name):
+    value = None
+    self.__setattr__(name, value)
+    return value
+
+  def __setattr__(self, name, value):
+    object.__setattr__(self, name, value)
+
+
+class Main(object):
+
+    def __init__(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-V', '--version', action='version', version='0.1')
+        parser.add_argument('-v', '--verbose', action='store_true',
+                            help='verbose mode')
+        parser.add_argument('-i', '--id', type=int,
+                            help='window ID to automate')
+        parser.add_argument('-n', '--name', type=str,
+                            help='window name to automate')
+        parser.add_argument('-b', '--border-width', type=int, default=1,
+                            help='width of yxcba border highlight')
+        parser.add_argument('-r', '--resolution', type=int, default=100,
+                            help='event resolution (ms)')
+        parser.add_argument('-s', '--speedup', type=float, default=1.0,
+                            help='speed up sleep statements (1.0)')
+        parser.add_argument('-l', '--list-windows', action='store_true',
+                            help='simply display a list of windows')
+        parser.add_argument('-w', '--wm', type=str, default='i3',
+                            help='window manager name (to handle quirks)')
+        parser.add_argument('-y', '--wm-height', type=int, default=0,
+                            help='window manager height to subtract from the root window size')
+        parser.add_argument('-x', '--wm-width', type=int, default=0,
+                            help='window manager width to subtract from the root window size')
+        parser.add_argument('-o', '--out', type=str, default=None,
+                            help='output file (stdout)')
+        parser.add_argument('-e', '--err', type=str, default=None,
+                            help='error file (stderr)')
+        parser.add_argument('-t', '--test-input', type=str, default=None,
+                            help='test input file')
+        self.args = parser.parse_args()
+        self.args.program = sys.argv[0]
+        if self.args.program[0] != '/':
+            self.args.program = os.path.join(os.getcwd(), self.args.program)
+        self.args.pdir = os.path.normpath(os.path.dirname(self.args.program))
+        self.args.program = os.path.basename(self.args.program)
+        if self.args.id and self.args.name:
+            print('cannot specify both window id and name')
+            parser.print_help()
+            sys.exit(1)
+        if self.args.verbose:
+            print('verbose mode', file=sys.stderr)
+            print('program dir: "%s" program: "%s"' % (self.args.pdir, self.args.program), file=sys.stderr)
+            print('id: %s' % str(self.args.id), file=sys.stderr)
+            print('name: %s' % str(self.args.name), file=sys.stderr)
+            print('border-width: %d' % self.args.border_width, file=sys.stderr)
+            print('wm: %s' % self.args.wm, file=sys.stderr)
+            print('wm-height: %d' % self.args.wm_height, file=sys.stderr)
+            print('wm-width: %d' % self.args.wm_width, file=sys.stderr)
+            print('list-windows: %s' % str(self.args.list_windows), file=sys.stderr)
+            print('resolution: %d' % self.args.resolution, file=sys.stderr)
+            print('speedup: %3.2f' % self.args.speedup, file=sys.stderr)
+            print('out: %s' % (self.args.out if self.args.out else 'STDOUT'), file=sys.stderr)
+            print('err: %s' % (self.args.err if self.args.err else 'STDERR'), file=sys.stderr)
+            print('test-input: %s' % (self.args.test_input if self.args.test_input else 'None'), file=sys.stderr)
+        if self.args.out:
+            self.outfile = open(self.args.out, 'w')
+        else:
+            self.outfile = sys.stdout
+        if self.args.err:
+            self.errfile = open(self.args.err, 'w')
+        else:
+            self.errfile = sys.stderr
+
+    # helper functions  ------------------------------------------------------------------
+
+    def msg(self, *objects):
+        print(*objects, file=self.errfile)
+
+    def vmsg(self, *objects):
+        if self.args.verbose:
+            self.msg(*objects)
+
+    def xte(self, *objects):
+        print(*objects, file=self.outfile)
+        if self.drag and len(objects) > 0:
+            self.vmsg('SAVE DRAG %s' % objects[0])
+            self.drag.append(objects[0])
+
+    # window helpers ------------------------------------------------------------
+
+    def update_client_list(self):
+        self.client_list = ewmh.get_client_list_stacking().reply()
+        if self.client_list[-1] == self.yxcba:
+            del self.client_list[-1] # remove self from list
+        self.client_ids = {}
+        self.client_names = {}
+        self.client_geoms = {}
+        for w in self.client_list:
+            name = ewmh.get_wm_name(w).reply()
+            self.client_names[w] = name
+            self.client_ids[name] = w
+            self.client_geoms[w] = window.get_geometry(w)
+        if self.args.verbose or self.args.list_windows:
+            for w in self.client_list:
+                self.msg("Window %d %s '%s'" % (w, self.client_geoms[w], self.client_names[w]))
+
+    def PickWindow(self, x, y):
+        self.vmsg('PickWindow at root: %d, %d' % (x, y))
+        self.update_client_list()
+        # examine from the top of the stack down
+        n = len(self.client_list)
+        for w in range(n):
+            wid = self.client_list[n - 1 - w]
+            geom = self.client_geoms[wid]
+            if x >= geom[0] and x < (geom[0] + geom[2]) and y >= geom[1] and y < (geom[1] + geom[3]):
+                self.args.id = wid
+                self.target_ready()
+                break
+
+    def move_away(self, delay=None): # move yxcba to the right
+        if not delay:
+            delay = self.fliptime
+        self.geom[0] += self.geom[2] # move to the right by one width
+        value_mask = xcb.xproto.ConfigWindow.X | xcb.xproto.ConfigWindow.Y | \
+                     xcb.xproto.ConfigWindow.Width | xcb.xproto.ConfigWindow.Height
+        conn.core.ConfigureWindowChecked(self.yxcba, value_mask, self.geom).check()
+        conn.core.SetInputFocus(xcb.xproto.InputFocus.PointerRoot, self.args.id, xcb.xproto.Time.CurrentTime)
+        conn.flush()
+        time.sleep(delay)
+
+    def move_back(self, delay=None):
+        if not delay:
+            delay = self.fliptime
+        time.sleep(delay)
+        self.geom[0] -= self.geom[2]
+        value_mask = xcb.xproto.ConfigWindow.X | xcb.xproto.ConfigWindow.Y | \
+                     xcb.xproto.ConfigWindow.Width | xcb.xproto.ConfigWindow.Height
+        conn.core.ConfigureWindowChecked(self.yxcba, value_mask, self.geom).check()
+        conn.core.SetInputFocus(xcb.xproto.InputFocus.PointerRoot, self.yxcba, xcb.xproto.Time.CurrentTime)
+        conn.flush()
+
+    def time_check(self, e):
+        # if not self.time:
+        #     return # the clock has not started yet
+        if not self.starttime:
+            self.starttime = e.time
+        delta = self.time
+        self.time = e.time - self.starttime
+        delta = self.time - delta
+        if delta > 0:
+            usec = int(delta * 1000.0 / self.args.speedup)
+            self.xte('usleep %d' % usec)
+
+    def set_cursor(self, cursorid):  # change cursor
+        value_mask = xcb.xproto.CW.Cursor
+        value_list = []
+        value_list.append(cursorid)
+        conn.core.ChangeWindowAttributesChecked(self.yxcba, value_mask, value_list).check()
+        conn.flush()
+
+    def target_ready(self):
+        self.geom = self.client_geoms[self.args.id]
+        self.vmsg('Target Window %d:' % self.args.id, self.geom, self.client_names[self.args.id])
+        # change window geom and position
+        # offset position by border width
+        self.geom = list(self.geom) # promote type to list for lvalue assignment
+        self.geom[2] -= self.args.border_width << 1
+        self.geom[3] -= self.args.border_width << 1
+        value_mask = xcb.xproto.ConfigWindow.X | xcb.xproto.ConfigWindow.Y | \
+                     xcb.xproto.ConfigWindow.Width | xcb.xproto.ConfigWindow.Height
+        conn.core.ConfigureWindowChecked(self.yxcba, value_mask, self.geom).check()
+        conn.flush()
+        # change to work cursor (if not already)
+        if self.cursor != self.work_cursor:
+            self.set_cursor(self.work_cursor)
+        # send a shift key to workaround the "first key bug"
+        e0 = Duck()
+        e0.time = 100
+        e0.detail = 50
+        e0.state = 0
+        e0.root_x = 0
+        e0.root_y = 0
+        self.KeyPress(e0)
+        time.sleep(self.fliptime)
+        e0.time += self.fliptime
+        self.KeyRelease(e0)
+        self.time = 0 # now the clock can start
+
+    # events ------------------------------------------------------------------
+
+    def KeyPress(self, e):
+        if self.time: # if the clock has started
+            self.time_check(e)
+            sym = keybind.get_keysym(e.detail)
+            letter = keybind.get_keysym_string(sym)
+            if letter == 'Escape':
+                sys.exit(1)
+            self.vmsg('KeyPress      @%d keycode %d (w/%4d) = %s' % (self.time, e.detail, e.state, letter))
+            self.xte('keydown %s' % letter)
+        if self.args.id:
+            if e.detail == self.last_keycode:
+                self.msg('dup keycode')
+                return
+            if self.time: # if the clock has started
+                self.last_keycode = e.detail
+            self.move_away()
+            self.xtest.FakeInput(event.Event.KeyPressEvent, e.detail, xcb.xproto.Time.CurrentTime, self.root, e.root_x, e.root_y, 0)
+            conn.flush()
+            self.move_back()
+            self.nexttime = e.time + self.args.resolution
+
+    def KeyRelease(self, e):
+        if self.time: # if the clock has started
+            self.time_check(e)
+            sym = keybind.get_keysym(e.detail)
+            letter = keybind.get_keysym_string(sym)
+            self.vmsg('KeyRelease    @%d keycode %d (w/%4d) = %s' % (self.time, e.detail, e.state, letter))
+            self.xte('keyup %s' % letter)
+        elif e.detail == 36:
+            self.vmsg('ignore first Return release')
+            return # ignore first key release if Return
+        if self.args.id:
+            self.move_away()
+            self.xtest.FakeInput(event.Event.KeyReleaseEvent, e.detail, xcb.xproto.Time.CurrentTime, self.root, e.root_x, e.root_y, 0)
+            conn.flush()
+            self.move_back()
+            self.nexttime = e.time + self.args.resolution
+
+    def ButtonPress(self, e):
+        if self.time: # if the clock has started
+            self.time_check(e)
+            self.vmsg('ButtonPress   @%d button %d (w/%4d) root %d, %d' % (self.time, e.detail, e.state, e.root_x, e.root_y))
+            self.xte('mousedown %d' % e.detail)
+        if not self.args.id:
+            if e.detail == 1:
+                self.PickWindow(e.root_x, e.root_y)
+        else: # we have a target
+            self.move_away(0.2)
+            self.xtest.FakeInput(event.Event.ButtonPressEvent, e.detail, xcb.xproto.Time.CurrentTime, self.root, e.root_x, e.root_y, 0)
+            conn.flush()
+            self.move_back()
+            self.nexttime = e.time + self.args.resolution
+            self.last_keycode = None
+            self.x = e.root_x # update latest mouse position
+            self.y = e.root_y
+
+    def ButtonRelease(self, e):
+        self.time_check(e)
+        self.vmsg('ButtonRelease @%d button %d (w/%4d) root %d, %d' % (self.time, e.detail, e.state, e.root_x, e.root_y))
+        self.xte('mouseup %d' % e.detail)
+        if self.drag:
+            self.replay_drag()
+        elif self.args.id:
+            self.move_away(0.2) # 0.2
+            self.xtest.FakeInput(event.Event.ButtonReleaseEvent, e.detail, xcb.xproto.Time.CurrentTime, self.root, e.root_x, e.root_y, 0)
+            conn.flush()
+            self.move_back(0.1)
+            self.nexttime = e.time + self.args.resolution
+            self.last_keycode = None
+
+    def MotionNotify(self, e):
+        if self.args.id:
+            if e.time > self.nexttime:
+                self.time_check(e)
+                self.vmsg('MotionNotify  @%d (w/%4d) root %d, %d' % (self.time, e.state, e.root_x, e.root_y))
+                if self.drag and e.state == 0:
+                    self.replay_drag()
+                if not self.drag and e.state:
+                    self.save_drag(e.state)
+                self.xte('mousemove %d %d' % (e.root_x, e.root_y))
+                self.nexttime = e.time + self.args.resolution
+                if not self.drag:
+                    self.move_away()
+                    self.xtest.FakeInput(event.Event.MotionNotifyEvent, 0, xcb.xproto.Time.CurrentTime, self.root, e.root_x, e.root_y, 0)
+                    conn.flush()
+                    self.move_back()
+                self.last_keycode = None
+                self.x = e.root_x # update latest mouse position
+                self.y = e.root_y
+
+
+    # play ------------------------------------------------------------------
+
+    def mousemove(self, x, y):
+        self.vmsg('mousemove %d %d' % (x, y))
+        self.xtest.FakeInput(event.Event.MotionNotifyEvent, 0, xcb.xproto.Time.CurrentTime, self.root, x, y, 0)
+        conn.flush()
+
+    def usleep(self, usec):
+        self.vmsg('usleep %d' % usec)
+        time.sleep(usec / 1000000.0)
+
+    def keydown(self, key):
+        keycode = keybind.lookup_string(key)
+        if not keycode:
+            self.vmsg('keydown %s keycode UNKNOWN' % key)
+        else:
+            self.vmsg('keydown %s keycode %d' % (key, keycode))
+            self.xtest.FakeInput(event.Event.KeyPressEvent, keycode, xcb.xproto.Time.CurrentTime, self.root, 0, 0, 0)
+            conn.flush()
+
+    def keyup(self, key):
+        keycode = keybind.lookup_string(key)
+        if not keycode:
+            self.vmsg('keyup %s keycode UNKNOWN' % key)
+        else:
+            self.vmsg('keyup %s keycode %d' % (key, keycode))
+            self.xtest.FakeInput(event.Event.KeyReleaseEvent, keycode, xcb.xproto.Time.CurrentTime, self.root, 0, 0, 0)
+            conn.flush()
+
+    def mousedown(self, button):
+        self.vmsg('mousedown %d' % button)
+        self.xtest.FakeInput(event.Event.ButtonPressEvent, button, xcb.xproto.Time.CurrentTime, self.root, 0, 0, 0)
+        conn.flush()
+
+    def mouseup(self, button):
+        self.vmsg('mouseup %d' % button)
+        self.xtest.FakeInput(event.Event.ButtonReleaseEvent, button, xcb.xproto.Time.CurrentTime, self.root, 0, 0, 0)
+        conn.flush()
+
+    # run ------------------------------------------------------------------
+
+    def run(self):
+        setup = conn.get_setup()
+        self.root = setup.roots[0].root
+        render = conn(xcb.render.key)
+        self.xtest = conn(xcb.xtest.key)
+        if self.args.test_input:
+            return self.replay()
+        self.yxcba = None # global window id
+        self.drag = None # list of actions during a drag
+        if self.args.list_windows:
+            self.update_client_list()
+            return 0
+        self.nexttime = 0 # next event time
+        self.starttime = None
+        self.time = None # haven't started yet
+        self.fliptime = 0.01 # 0.005
+        self.last_keycode = None
+        self.x = 0 # last client mouse position
+        self.y = 0
+        screen = render.QueryPictFormats().reply().screens[0]
+        visual = get_visual_32(screen)
+        if not visual:
+            self.msg('no 32 bit visual found')
+            return 1
+        # custom colormap
+        self.colormapid = conn.generate_id()
+        conn.core.CreateColormapChecked(xcb.xproto.ColormapAlloc._None, self.colormapid, self.root, visual).check()
+        # get size of root window
+        self.root_geom = ewmh.get_desktop_geometry().reply()
+        self.yxcba = conn.generate_id()
+        self.vmsg('my window id:', self.yxcba)
+        x = 0
+        y = 0
+        root_width = self.root_geom['width'] - self.args.wm_width
+        root_height = self.root_geom['height'] - self.args.wm_height
+        # calculate desired window size
+        width = root_width - (self.args.border_width << 1)
+        height = root_height - (self.args.border_width << 1)
+        self.geom = [x, y, root_width, root_height]
+        _class = xcb.xproto.WindowClass.InputOutput
+        bg_pixel = argb(0, 0, 0, 0)
+        border_pixel = argb(32, 0, 255, 0)
+        # value_list order is significant
+        value_mask = xcb.xproto.CW.Colormap | xcb.xproto.CW.BackPixel | xcb.xproto.CW.BorderPixel | xcb.xproto.CW.EventMask
+        value_list = []
+        value_list.append(bg_pixel)
+        value_list.append(border_pixel)
+        value_list.append(EM.KeyPress | EM.KeyRelease | EM.ButtonPress | EM.ButtonRelease | EM.PointerMotion)
+        value_list.append(self.colormapid)
+        conn.core.CreateWindowChecked(32, self.yxcba, self.root, x, y, width, height,
+                                      self.args.border_width, _class, visual, value_mask, value_list).check()
+        # name window
+        ewmh.set_wm_name(self.yxcba, "yxcba")
+        conn.core.MapWindowChecked(self.yxcba).check()
+        conn.flush()
+        # set cursor
+        self.pick_cursor = cursor.create_font_cursor(cursor.FontCursor.Circle, 0, 0xffff, 0, 0, 0, 0xffff)
+        self.work_cursor = cursor.create_font_cursor(cursor.FontCursor.Crosshair, 0, 0xffff, 0, 0, 0, 0xffff)
+        self.cursor = None
+        if self.args.id:
+            self.update_client_list()
+            if self.args.id in self.client_names:
+                self.target_ready()
+            else:
+                self.msg('window id not found: %d' % self.args.id)
+                return 1
+        elif self.args.name:
+            self.update_client_list()
+            # exact match
+            # if self.args.name in self.client_ids:
+            #     self.args.id = self.client_ids[self.args.name]
+            #     self.target_ready()
+            # regex match
+            for w in self.client_list:
+                name = self.client_names[w]
+                if name:
+                    if re.match(self.args.name, name):
+                        self.args.id = w
+                        self.target_ready()
+                        break
+            if not self.args.id:
+                self.msg('window name not found: %s' % self.args.name)
+                return 1
+        else:
+            self.msg('select window...')
+            if self.args.wm == 'i3':
+                os.system('i3-msg \'[title="yxcba"] move absolute position 0 px 0 px\' > /dev/null')
+            self.set_cursor(self.pick_cursor)
+
+        # bind events
+        event.connect('KeyPress', self.yxcba, self.KeyPress)
+        event.connect('KeyRelease', self.yxcba, self.KeyRelease)
+        event.connect('ButtonPress', self.yxcba, self.ButtonPress)
+        event.connect('ButtonRelease', self.yxcba, self.ButtonRelease)
+        event.connect('MotionNotify', self.yxcba, self.MotionNotify)
+        # main event loop
+        event.main()
+        return 0 # not reached
+
+    def save_drag(self, state):
+        self.vmsg('DRAG START ----------')
+        self.drag = []
+        action = 'mousemove %d %d' % (self.x, self.y)
+        self.vmsg('SAVE DRAG first %s' % action)
+        self.drag.append(action)
+        if (state & 0x1000):
+            button = 5
+        elif (state & 0x800):
+            button = 4
+        elif (state & 0x400):
+            button = 3
+        elif (state & 0x200):
+            button = 2
+        else:
+            button = 1
+        action = 'mousedown %d' % button
+        self.vmsg('SAVE DRAG second %s' % action)
+        self.drag.append(action)
+
+    def replay_drag(self):
+        self.vmsg('DRAG END ----------')
+        self.vmsg('REPLAY DRAG START ----------')
+        self.move_away()
+        for action in self.drag:
+            self.replay_action(action)
+        self.drag = None
+        self.vmsg('REPLAY DRAG END ----------')
+        self.move_back()
+
+    def replay_action(self, action):
+        fields = action.split()
+        if len(fields) > 1:
+            if fields[0] == 'usleep':
+                self.usleep(int(fields[1]))
+            elif fields[0] == 'mousemove':
+                self.mousemove(int(fields[1]), int(fields[2]))
+            elif fields[0] == 'keydown':
+                self.keydown(fields[1])
+            elif fields[0] == 'keyup':
+                self.keyup(fields[1])
+            elif fields[0] == 'mousedown':
+                self.mousedown(int(fields[1]))
+            elif fields[0] == 'mouseup':
+                self.mouseup(int(fields[1]))
+
+    def replay(self):
+        print('REPLAY:', self.args.test_input)
+        test_file = open(self.args.test_input, 'r')
+        for line in test_file:
+            self.replay_action(line[:-1])
+        test_file.close()
+        return 0
+
+if __name__ == '__main__':
+    sys.exit(Main().run())
