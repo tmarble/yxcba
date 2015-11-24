@@ -23,6 +23,7 @@ import xpybutil.event as event
 import xpybutil.cursor as cursor
 import xpybutil.window as window
 import xpybutil.keybind as keybind
+import xpybutil.icccm as icccm
 
 
 def argb(a, r, g, b):
@@ -147,7 +148,8 @@ class Main(object):
         self.client_names = {}
         self.client_geoms = {}
         for w in self.client_list:
-            name = ewmh.get_wm_name(w).reply()
+            # name = ewmh.get_wm_name(w).reply()
+            name = icccm.get_wm_name(w).reply()
             self.client_names[w] = name
             self.client_ids[name] = w
             self.client_geoms[w] = window.get_geometry(w)
@@ -457,7 +459,7 @@ class Main(object):
         else:
             self.msg('select window...')
             if self.args.wm == 'i3':
-                os.system('i3-msg \'[title="yxcba"] move absolute position 0 px 0 px\' > /dev/null')
+                os.system('i3-msg \'[title=yxcba] focus; move absolute position -1 px -1 px\' > /dev/null')
             self.set_cursor(self.pick_cursor)
 
         # bind events
